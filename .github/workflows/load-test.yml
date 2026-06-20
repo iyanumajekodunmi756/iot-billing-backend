@@ -1,0 +1,83 @@
+name: Load Test Smoke
+
+# This workflow runs the scaled-down smoke load test from issue #20.
+# It validates the end-to-end wiring (mock server boot, HTTP ingestion,
+# validator + nonce CAS, fault-injection tolerances, JSON metrics
+# output) without exhausting CI resources. The full 50k / 5min profile
+# is meant to run against a real staging cluster using the bundled
+# k6 snapshots; see tests/load/k6_scripts/README.md for the staging
+# runbook. We gate P99 against a 2000ms CI ceiling here because the
+# issue's strict 500ms target is only meaningful at the 50,000-device
+# production scale.
+
+on:
+  pull_request:
+    paths:
+      - 'tests/load/**'
+      - 'src/core/ingestion/**'
+      - '.github/workflows/load-test.yml'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  load-test-smoke:
+    name: Load Test Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check load suite
+        run: npm run typecheck
+
+      - name: Lint load suite
+        run: npx eslint tests/load/ tests/unit/load/ --ext .ts
+
+      - name: Unit tests for load suite
+        run: npm run test:load:unit
+
+      - name: Smoke run against the mock ingestion gateway
+        env:
+          SMOKE_PORT: '0'
+          SMOKE_CONCURRENT: '25'
+          SMOKE_DURATION_SEC: '5'
+          SMOKE_LATENCY_MS: '1'
+          SMOKE_P99_CEILING_MS: '2000'
+          SMOKE_OUTPUT: ${{ github.workspace }}/load-test-results.json
+        run: npm run load:smoke
+
+      - name: Validate smoke gates
+        run: |
+          node -e "
+            const fs = require('node:fs');
+            const p = './load-test-results.json';
+            const r = JSON.parse(fs.readFileSync(p, 'utf-8'));
+            const ceilingMs = Number(process.env.SMOKE_P99_CEILING_MS || '2000');
+            if (!r.metrics) { console.error('missing metrics'); process.exit(1); }
+            if (r.metrics.accepted <= 0) { console.error('zero accepted'); process.exit(1); }
+            if (r.metrics.latency.p99Ms > ceilingMs) {
+              console.error('P99 ' + r.metrics.latency.p99Ms.toFixed(2) + 'ms exceeded ceiling ' + ceilingMs + 'ms');
+              process.exit(1);
+            }
+            if (r.metrics.errorRate > 0.20) { console.error('errorRate > 20%'); process.exit(1); }
+            console.log('OK accepted=' + r.metrics.accepted + ' p99=' + r.metrics.latency.p99Ms.toFixed(2) + 'ms ceiling=' + ceilingMs + 'ms');
+          "
+
+      - name: Upload load-test artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-results
+          path: load-test-results.json
+          retention-days: 7

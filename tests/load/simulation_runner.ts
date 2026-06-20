@@ -4,23 +4,27 @@
  * Mocks up to 50,000 active concurrent connections delivering real-time
  * telemetry inputs for system performance auditing.
  *
- * Usage: tsx tests/load/simulation_runner.ts [concurrentClients] [durationSec]
+ * Usage:
+ *   tsx tests/load/simulation_runner.ts [profile] [concurrentClients] [durationSec] [--http URL]
+ *
+ * Profiles (issue #20):
+ *   - local         : legacy in-process `validateSignature` only.
+ *                      Stays synchronous; useful for unit tests and CI smoke.
+ *   - steady_state  : sustained 1 payload/sec/device load for `durationSec`.
+ *   - burst         : 8 payloads/sec/device SHORT-window peak load.
+ *   - recovery      : 0.25 payloads/sec/device - lets sliding-window + nonce
+ *                      cache drain between bursts.
+ *
+ * When `--http URL` is provided (or env `LOAD_TARGET_URL`), the runner
+ * spins up HTTP workers against that ingestion endpoint instead of
+ * running the in-process check.
  */
 
-import { validateSignature, SignedPayload } from '../../src/core/ingestion/validator.js';
+import { validateSignature, type SignedPayload } from '../../src/core/ingestion/validator.js';
 import nacl from 'tweetnacl';
 import { Buffer } from 'node:buffer';
-
-interface SimulationMetrics {
-  totalPayloads: number;
-  accepted: number;
-  rejected: number;
-  errors: number;
-  avgLatencyMs: number;
-  p95LatencyMs: number;
-  p99LatencyMs: number;
-  throughputPerSec: number;
-}
+import { runLoad, profileDefaults, type RunLoadOptions } from './lib/run_load.js';
+import { type LoadMetrics, type LoadProfile, type SimulationMetrics } from './lib/types.js';
 
 interface SimulatedDevice {
   deviceId: string;
@@ -78,7 +82,7 @@ async function runSimulation(
   durationSec: number,
 ): Promise<SimulationMetrics> {
   console.log(
-    `Starting simulation: ${String(concurrentClients)} clients for ${String(durationSec)}s`,
+    `Starting local simulation: ${String(concurrentClients)} clients for ${String(durationSec)}s`,
   );
 
   const latencies: number[] = [];
@@ -104,11 +108,13 @@ async function runSimulation(
   await Promise.all(workers);
 
   const elapsedSec = (Date.now() - startTime) / 1000;
-  const sortedLatencies = [...latencies].sort((a, b) => a - b);
+  const sortedLatencies = [...latencies].sort(compareNumbers);
   const n = sortedLatencies.length;
   const avgLatencyMs = n > 0 ? sortedLatencies.reduce((a, b) => a + b, 0) / n : 0;
-  const p95LatencyMs = n > 0 ? (sortedLatencies[Math.floor(n * 0.95)] ?? 0) : 0;
-  const p99LatencyMs = n > 0 ? (sortedLatencies[Math.floor(n * 0.99)] ?? 0) : 0;
+  const p95 = n > 0 ? Math.floor(n * 0.95) : 0;
+  const p99 = n > 0 ? Math.floor(n * 0.99) : 0;
+  const p95LatencyMs = p95 > 0 ? (sortedLatencies[p95] ?? 0) : 0;
+  const p99LatencyMs = p99 > 0 ? (sortedLatencies[p99] ?? 0) : 0;
 
   return {
     totalPayloads: accepted + rejected + errors,
@@ -122,18 +128,112 @@ async function runSimulation(
   };
 }
 
-const concurrentClients = Number(process.argv[2]) || 1000;
-const durationSec = Number(process.argv[3]) || 30;
+function compareNumbers(a: number, b: number): number {
+  return a - b;
+}
 
-runSimulation(concurrentClients, durationSec)
-  .then((metrics) => {
-    console.log('\n=== SIMULATION RESULTS ===');
-    console.log(JSON.stringify(metrics, null, 2));
-    process.exit(0);
-  })
-  .catch((err: unknown) => {
-    console.error('Simulation failed:', err);
-    process.exit(1);
+interface ParsedArgs {
+  profile: LoadProfile;
+  concurrentClients: number;
+  durationSec: number;
+  targetUrl: string | null;
+  writeJsonPath: string | null;
+}
+
+function parseArgs(argv: readonly string[]): ParsedArgs {
+  const args = [...argv];
+  let profile: LoadProfile = 'local';
+  let concurrentClients = 1000;
+  let durationSec = 30;
+  let targetUrl: string | null = null;
+  let writeJsonPath: string | null = null;
+
+  const first = args.shift();
+  if (first === 'steady_state' || first === 'burst' || first === 'recovery' || first === 'local') {
+    profile = first;
+  } else if (first !== undefined && /^\d+$/.test(first)) {
+    concurrentClients = Number.parseInt(first, 10);
+  }
+
+  while (args.length > 0) {
+    const token = args.shift();
+    if (token === '--http' && args.length > 0) {
+      targetUrl = args.shift() ?? null;
+    } else if (token === '--json' && args.length > 0) {
+      writeJsonPath = args.shift() ?? null;
+    } else if (token !== undefined && /^\d+$/.test(token)) {
+      if (concurrentClients === 1000) {
+        concurrentClients = Number.parseInt(token, 10);
+      } else {
+        durationSec = Number.parseInt(token, 10);
+      }
+    }
+  }
+
+  if (targetUrl == null) {
+    const env = process.env['LOAD_TARGET_URL'];
+    if (env !== undefined && env !== '') {
+      targetUrl = env;
+    }
+  }
+
+  return { profile, concurrentClients, durationSec, targetUrl, writeJsonPath };
+}
+
+export async function runProfile(
+  profile: LoadProfile,
+  targetUrl: string,
+  concurrentClients: number,
+  durationSec: number,
+  extraOpts: Partial<RunLoadOptions> = {},
+): Promise<LoadMetrics> {
+  const defaults = profileDefaults(profile);
+  console.log(
+    `[simulation_runner] HTTP profile=${profile} clients=${String(concurrentClients)} ` +
+      `duration=${String(durationSec)}s target=${targetUrl} ` +
+      `payloadsPerSec=${String(defaults.payloadsPerSec)}`,
+  );
+  return runLoad({
+    profile,
+    targetUrl,
+    concurrentClients,
+    durationSec,
+    payloadsPerSec: defaults.payloadsPerSec,
+    ...extraOpts,
   });
+}
+
+async function main(): Promise<void> {
+  const { profile, concurrentClients, durationSec, targetUrl, writeJsonPath } = parseArgs(
+    process.argv.slice(2),
+  );
+
+  let metrics: LoadMetrics | SimulationMetrics;
+  if (profile === 'local' || targetUrl === null) {
+    metrics = await runSimulation(concurrentClients, durationSec);
+  } else {
+    metrics = await runProfile(profile, targetUrl, concurrentClients, durationSec);
+  }
+
+  console.log('\n=== SIMULATION RESULTS ===');
+  console.log(JSON.stringify(metrics, null, 2));
+
+  if (writeJsonPath !== null) {
+    const fs = await import('node:fs');
+    await fs.promises.writeFile(writeJsonPath, JSON.stringify(metrics, null, 2), 'utf-8');
+    console.log(`[simulation_runner] wrote metrics → ${writeJsonPath}`);
+  }
+}
+
+if (process.argv[1] !== undefined && process.argv[1].endsWith('simulation_runner.ts')) {
+  main()
+    .then(() => {
+      process.exit(0);
+    })
+    .catch((err: unknown) => {
+      console.error('Simulation failed:', err);
+      process.exit(1);
+    });
+}
 
 export { runSimulation };

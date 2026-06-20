@@ -7,3 +7,5 @@ dist/
 coverage/
 .turbo/
 prisma/migrations/
+tests/load/dist/k6/
+load-test-results.json
