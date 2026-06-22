@@ -72,6 +72,15 @@ export class ElasticPoolManager {
     return this.pools.get(name);
   }
 
+  /**
+   * Returns the names of every pool currently registered with this manager.
+   * Used by the Prometheus pool-metrics collector to iterate over all pools
+   * (see src/api/metrics/pool_metrics_collector.ts).
+   */
+  getPoolNames(): string[] {
+    return Array.from(this.pools.keys());
+  }
+
   getGlobalMin(): number {
     return this.globalMinConnections;
   }
@@ -346,6 +355,15 @@ function getPoolManager(): ElasticPoolManager {
     connectionString: env.TIMESCALEDB_URL,
   });
   return cachedManager;
+}
+
+/**
+ * Public accessor for the lazily-initialized pool manager singleton. The
+ * Prometheus `PoolMetricsCollector` (issue #19) needs to enumerate and read
+ * per-pool stats from the same instance that the rest of the app uses.
+ */
+export function getSharedPoolManager(): ElasticPoolManager {
+  return getPoolManager();
 }
 
 export function getTenantPoolProxy(): TenantAwarePoolProxy {

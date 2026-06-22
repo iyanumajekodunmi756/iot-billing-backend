@@ -22,10 +22,27 @@ export interface SyncState {
   errorCount: number;
 }
 
+export interface LedgerPollEvent {
+  /** Sequence returned by the latest `/ledgers/latest` RPC poll. */
+  latestSequence: number;
+  /** Most recent sequence the synchronizer has persisted. */
+  lastSyncedLedger: number;
+  /** max(0, latestSequence - lastSyncedLedger). */
+  lag: number;
+}
+
 interface SynchronizerOptions {
   startingLedger?: number;
   concurrency?: number;
   pollIntervalMs?: number;
+  /**
+   * Called whenever RPC polling observes a new latest sequence or an error
+   * occurs. Issue #19 hooks this callback to publish the
+   * `ledger_sync_lag` gauge.
+   */
+  onPoll?: (event: LedgerPollEvent) => void;
+  /** Called when an RPC poll fails. Issue #19 increments an error counter here. */
+  onPollError?: (error: unknown) => void;
 }
 
 export class LedgerEventSynchronizer {
@@ -38,7 +55,10 @@ export class LedgerEventSynchronizer {
   private readonly concurrency: number;
   private readonly pollIntervalMs: number;
   private readonly startingLedger: number;
+  private readonly onPoll: ((event: LedgerPollEvent) => void) | null;
+  private readonly onPollError: ((error: unknown) => void) | null;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
+  private latestPolledSequence: number | null = null;
 
   constructor(
     private prisma: PrismaClient,
@@ -48,6 +68,8 @@ export class LedgerEventSynchronizer {
     this.startingLedger = options.startingLedger ?? 0;
     this.concurrency = options.concurrency ?? 10;
     this.pollIntervalMs = options.pollIntervalMs ?? 5000;
+    this.onPoll = options.onPoll ?? null;
+    this.onPollError = options.onPollError ?? null;
   }
 
   async start(): Promise<void> {
@@ -137,12 +159,47 @@ export class LedgerEventSynchronizer {
     try {
       const response = await this.rpcFetch(`${this.rpcUrl}/ledgers/latest`);
       const latest = (await response.json()) as { sequence: number };
+      this.latestPolledSequence = latest.sequence;
+      this.emitPoll();
       if (latest.sequence > this.lastSyncedLedger) {
         await this.catchUp(this.lastSyncedLedger, latest.sequence);
+        // After catchUp completes, emit a fresh poll event so the
+        // ledger_sync_lag gauge reflects the new lastSyncedLedger.
+        this.emitPoll();
       }
     } catch (error) {
       console.error('Polling error:', error);
+      if (this.onPollError !== null) {
+        this.onPollError(error);
+      }
     }
+  }
+
+  /**
+   * Sequence number most recently reported by the RPC poll loop, or null if
+   * no poll has succeeded yet. Exposed for metrics and admin observability.
+   */
+  getLatestPolledSequence(): number | null {
+    return this.latestPolledSequence;
+  }
+
+  /**
+   * Lag (in ledgers) between the latest polled sequence and what the
+   * synchronizer has persisted. Returns 0 if we are caught up or unknown if
+   * no poll has succeeded yet.
+   */
+  getLedgerLag(): number | null {
+    if (this.latestPolledSequence === null) return null;
+    return Math.max(0, this.latestPolledSequence - this.lastSyncedLedger);
+  }
+
+  private emitPoll(): void {
+    if (this.onPoll === null || this.latestPolledSequence === null) return;
+    this.onPoll({
+      latestSequence: this.latestPolledSequence,
+      lastSyncedLedger: this.lastSyncedLedger,
+      lag: Math.max(0, this.latestPolledSequence - this.lastSyncedLedger),
+    });
   }
 
   private async fetchLedger(sequence: number): Promise<LedgerEntry> {

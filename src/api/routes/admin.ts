@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import type { Prisma } from '@prisma/client';
 import { getEnv } from '../../config/env.js';
 import { IngestionStateMachine, IngestionState } from '../../core/ingestion/state_machine.js';
 import type { LedgerEventSynchronizer } from '../../core/blockchain/event_listener.js';
@@ -222,7 +223,7 @@ export function registerAdminRoutes(
             .send({ success: false, error: 'Certificate is already revoked' });
         }
 
-        await prisma.$transaction(async (tx) => {
+        await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
           await tx.hardwareCertificate.update({
             where: { serial },
             data: { revoked: true },

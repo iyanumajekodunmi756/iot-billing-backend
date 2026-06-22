@@ -11,7 +11,7 @@ export interface MtlsVerificationResult {
 }
 
 export class MtlsGatewayVerifier {
-  private prisma = new PrismaClient();
+  private prisma: PrismaClient = new PrismaClient();
   private redis = getRedis();
   private pgClient?: pg.Client;
 
@@ -128,9 +128,9 @@ export class MtlsGatewayVerifier {
         // Proceed to OCSP
       } else {
         // Query DB
-        const hwCert = await this.prisma.hardwareCertificate.findUnique({
+        const hwCert = (await this.prisma.hardwareCertificate.findUnique({
           where: { serial },
-        });
+        })) as { revoked: boolean } | null;
 
         if (!hwCert) {
           return {
